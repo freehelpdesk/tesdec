@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -29,9 +30,14 @@ Examples:
   tesdec decrypt /Volumes/TESLA/TeslaCam --in-place
   tesdec decrypt - < clip.mp4 > plain.mp4
   tesdec decrypt clip.mp4 --output -
+  tesdec --verbose decrypt /Volumes/TESLA/TeslaCam --output ~/TeslaCam-plain
 "
 )]
 struct Cli {
+    /// Print the plan, each key request, clip metadata, and timings on stderr.
+    /// Tokens and AES keys are not included.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -119,13 +125,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match cli.command {
         Command::Login(args) => {
             let endpoints = auth::Endpoints::from_region(
                 &args.region,
                 args.auth_base.as_deref(),
                 args.api_base.as_deref(),
             )?;
+            if cli.verbose {
+                eprintln!("login: auth {}", endpoints.auth_base);
+                eprintln!("login: key service {}", endpoints.api_base);
+            }
             auth::login(
                 &endpoints,
                 args.paste,
@@ -135,11 +146,11 @@ fn run() -> Result<()> {
         }
         Command::Logout => auth::logout(),
         Command::Status => auth::status(),
-        Command::Decrypt(args) => decrypt(args),
+        Command::Decrypt(args) => decrypt(args, cli.verbose),
     }
 }
 
-fn decrypt(args: DecryptArgs) -> Result<()> {
+fn decrypt(args: DecryptArgs, verbose: bool) -> Result<()> {
     if args.batch_size == 0 || args.batch_size > api::MAX_BATCH {
         bail!("--batch-size must be from 1 to {}", api::MAX_BATCH);
     }
@@ -228,17 +239,18 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         emit("No clips to decrypt.");
         return Ok(());
     }
+    let threads = args.jobs.min(planned.jobs.len().max(1));
+    let output = output_label(&args, mode);
     if args.dry_run {
+        log_plan(verbose, &planned, threads, args.batch_size, &output);
         for job in &planned.jobs {
             let action = match &job.kind {
                 JobKind::Decrypt(_) => "decrypt",
                 JobKind::Copy => "copy",
             };
-            emit(&format!(
-                "{action}  {} -> {}",
-                job.label,
-                dest_label(&job.dest)
-            ));
+            let dest = dest_label(&job.dest);
+            emit(&format!("{action}  {} -> {dest}", job.label));
+            vlog(verbose, plan_detail(job, &dest));
         }
         emit(&format!(
             "{} file(s) ready, {} skipped, {} unreadable.",
@@ -251,6 +263,7 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         }
         return Ok(());
     }
+    log_plan(verbose, &planned, threads, args.batch_size, &output);
 
     if args.in_place {
         files::confirm_in_place(&planned.jobs, args.yes)?;
@@ -272,8 +285,13 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
     let ok = AtomicUsize::new(0);
     let failed_tasks = AtomicUsize::new(0);
     let mut failed_now = planned.invalid.len();
-    let threads = args.jobs.min(planned.jobs.len().max(1));
     let to_stdout = mode.to_stdout;
+    let started = Instant::now();
+    if verbose {
+        if let Some(session) = &session {
+            eprintln!("decrypt: key service {}", session.api_base);
+        }
+    }
     // The queue outlives the worker threads. `scope` joins them before returning.
     let (tx, rx) = mpsc::channel();
     let rx = Mutex::new(rx);
@@ -294,7 +312,7 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                             Err(_) => break,
                         }
                     };
-                    execute_task(task, to_stdout, ok, failed_tasks);
+                    execute_task(task, to_stdout, verbose, ok, failed_tasks);
                 }
             });
         }
@@ -304,11 +322,15 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
             .iter()
             .filter(|job| matches!(job.kind, JobKind::Decrypt(_)))
             .collect();
+        let batches = decrypt_jobs.len().div_ceil(args.batch_size.max(1));
         let mut index = 0usize;
+        let mut batch_no = 0usize;
         while index < decrypt_jobs.len() {
             let end = (index + args.batch_size).min(decrypt_jobs.len());
             let chunk = &decrypt_jobs[index..end];
             index = end;
+            batch_no += 1;
+            let batch_started = Instant::now();
             let items: Vec<_> = chunk
                 .iter()
                 .map(|job| match &job.kind {
@@ -317,6 +339,14 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                 })
                 .collect();
             let current = session.clone().context("missing Tesla session")?;
+            vlog(
+                verbose,
+                format!(
+                    "keys batch {batch_no}/{batches} start, {} clips, {}",
+                    chunk.len(),
+                    current.api_base
+                ),
+            );
             let fetched = match api::fetch_keys(&current.api_base, &current.access_token, &items) {
                 Ok(fetched) => fetched,
                 Err(FetchError::Unauthorized) => {
@@ -343,21 +373,47 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                 }
                 Err(FetchError::Failed(message)) => {
                     eprintln!("error: {message}");
+                    vlog(
+                        verbose,
+                        format!(
+                            "keys batch {batch_no}/{batches} failed, {} clips",
+                            chunk.len()
+                        ),
+                    );
                     failed_now += chunk.len();
                     continue;
                 }
             };
+            vlog(
+                verbose,
+                format!(
+                    "keys batch {batch_no}/{batches} done, {} keys, {} errors, {}",
+                    fetched.keys.len(),
+                    fetched.errors.len(),
+                    format_duration(batch_started.elapsed())
+                ),
+            );
             let mut errors = std::collections::HashMap::new();
             for (id, message) in fetched.errors {
                 errors.insert(id, message);
             }
             for (job, item) in chunk.iter().zip(items.iter()) {
                 if let Some(message) = errors.get(&item.id) {
+                    let meta = clip_meta(job);
+                    vlog(
+                        verbose,
+                        fail_detail(&job.label, batch_started.elapsed(), meta.as_ref()),
+                    );
                     eprintln!("error: {} — {message}", job.label);
                     failed_now += 1;
                     continue;
                 }
                 let Some(key) = fetched.keys.get(&item.id) else {
+                    let meta = clip_meta(job);
+                    vlog(
+                        verbose,
+                        fail_detail(&job.label, batch_started.elapsed(), meta.as_ref()),
+                    );
                     eprintln!("error: {} — Tesla did not return a key", job.label);
                     failed_now += 1;
                     continue;
@@ -367,6 +423,7 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                     src: job.src.clone(),
                     dest: job.dest.clone(),
                     op: TaskOp::Decrypt(key.clone()),
+                    meta: clip_meta(job),
                 })
                 .context("decrypt worker stopped")?;
             }
@@ -382,6 +439,7 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                 src: job.src.clone(),
                 dest: job.dest.clone(),
                 op: TaskOp::Copy,
+                meta: None,
             })
             .context("decrypt worker stopped")?;
         }
@@ -401,6 +459,14 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         "Done. {ok} written, {} skipped, {failed} failed.",
         planned.skipped.len()
     ));
+    vlog(
+        verbose,
+        format!(
+            "finished {ok} written, {} skipped, {failed} failed, {}",
+            planned.skipped.len(),
+            format_duration(started.elapsed())
+        ),
+    );
     if failed > 0 {
         bail!("{failed} file(s) failed");
     }
@@ -412,6 +478,13 @@ struct Task {
     src: PathBuf,
     dest: PathBuf,
     op: TaskOp,
+    meta: Option<ClipMeta>,
+}
+
+struct ClipMeta {
+    vin: String,
+    key_id: u32,
+    timestamp: u64,
 }
 
 enum TaskOp {
@@ -425,38 +498,187 @@ fn default_jobs() -> usize {
         .unwrap_or(4)
 }
 
-fn execute_task(task: Task, to_stdout: bool, ok: &AtomicUsize, failed: &AtomicUsize) {
+fn execute_task(
+    task: Task,
+    to_stdout: bool,
+    verbose: bool,
+    ok: &AtomicUsize,
+    failed: &AtomicUsize,
+) {
     let show = |line: String| {
         if !to_stdout {
             println!("{line}");
         }
     };
+    let dest = if to_stdout {
+        "stdout".to_string()
+    } else {
+        task.dest.display().to_string()
+    };
+    let started = Instant::now();
     match task.op {
-        TaskOp::Decrypt(key) => match container::decrypt_file(&task.src, &task.dest, &key) {
-            Ok(bytes) => {
-                show(format!(
-                    "decrypted  {} -> {} ({})",
-                    task.label,
-                    task.dest.display(),
-                    format_bytes(bytes)
-                ));
-                ok.fetch_add(1, Ordering::Relaxed);
+        TaskOp::Decrypt(ref key) => {
+            let key_len = key.len();
+            match container::decrypt_file(&task.src, &task.dest, key) {
+                Ok(bytes) => {
+                    show(format!(
+                        "decrypted  {} -> {} ({})",
+                        task.label,
+                        task.dest.display(),
+                        format_bytes(bytes)
+                    ));
+                    vlog(
+                        verbose,
+                        finish_detail(&task, &dest, bytes, started.elapsed(), Some(key_len)),
+                    );
+                    ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    vlog(
+                        verbose,
+                        fail_detail(&task.label, started.elapsed(), task.meta.as_ref()),
+                    );
+                    eprintln!("error: {} — {err:#}", task.label);
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(err) => {
-                eprintln!("error: {} — {err:#}", task.label);
-                failed.fetch_add(1, Ordering::Relaxed);
-            }
-        },
+        }
         TaskOp::Copy => match files::copy_file(&task.src, &task.dest) {
-            Ok(_) => {
+            Ok(bytes) => {
                 show(format!("copied  {} -> {}", task.label, task.dest.display()));
+                vlog(
+                    verbose,
+                    finish_detail(&task, &dest, bytes, started.elapsed(), None),
+                );
                 ok.fetch_add(1, Ordering::Relaxed);
             }
             Err(err) => {
+                vlog(verbose, fail_detail(&task.label, started.elapsed(), None));
                 eprintln!("error: {} — {err:#}", task.label);
                 failed.fetch_add(1, Ordering::Relaxed);
             }
         },
+    }
+}
+
+fn vlog(verbose: bool, line: impl AsRef<str>) {
+    if verbose {
+        eprintln!("decrypt: {}", line.as_ref());
+    }
+}
+
+fn output_label(args: &DecryptArgs, mode: files::StdioMode) -> String {
+    if mode.to_stdout {
+        "stdout".to_string()
+    } else if args.in_place {
+        "in place".to_string()
+    } else {
+        args.output
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn log_plan(verbose: bool, planned: &files::Plan, threads: usize, batch_size: usize, output: &str) {
+    if !verbose {
+        return;
+    }
+    let decrypt_n = planned
+        .jobs
+        .iter()
+        .filter(|job| matches!(job.kind, JobKind::Decrypt(_)))
+        .count();
+    let copy_n = planned.jobs.len() - decrypt_n;
+    eprintln!(
+        "decrypt: plan {}, {}, {}, {}, {}, batch {batch_size}",
+        count_label(decrypt_n, "encrypted", "encrypted"),
+        count_label(copy_n, "copy", "copies"),
+        count_label(planned.skipped.len(), "skipped", "skipped"),
+        count_label(planned.invalid.len(), "unreadable", "unreadable"),
+        count_label(threads, "worker", "workers")
+    );
+    eprintln!("decrypt: output {output}");
+}
+
+fn plan_detail(job: &files::Job, dest: &str) -> String {
+    match &job.kind {
+        JobKind::Decrypt(header) => format!(
+            "plan {} -> {dest} plaintext {} vin={} key_id={} timestamp={}",
+            job.label,
+            format_bytes(header.plaintext_size),
+            header.vin,
+            header.key_id,
+            header.timestamp
+        ),
+        JobKind::Copy => format!("plan copy {} -> {dest}", job.label),
+    }
+}
+
+fn clip_meta(job: &files::Job) -> Option<ClipMeta> {
+    match &job.kind {
+        JobKind::Decrypt(header) => Some(ClipMeta {
+            vin: header.vin.clone(),
+            key_id: header.key_id,
+            timestamp: header.timestamp,
+        }),
+        JobKind::Copy => None,
+    }
+}
+
+fn finish_detail(
+    task: &Task,
+    dest: &str,
+    bytes: u64,
+    elapsed: Duration,
+    key_len: Option<usize>,
+) -> String {
+    match (&task.meta, key_len) {
+        (Some(meta), Some(len)) => format!(
+            "ok {} -> {dest} {} in {} vin={} key_id={} timestamp={} key={len}B",
+            task.label,
+            format_bytes(bytes),
+            format_duration(elapsed),
+            meta.vin,
+            meta.key_id,
+            meta.timestamp
+        ),
+        _ => format!(
+            "copy {} -> {dest} {} in {}",
+            task.label,
+            format_bytes(bytes),
+            format_duration(elapsed)
+        ),
+    }
+}
+
+fn fail_detail(label: &str, elapsed: Duration, meta: Option<&ClipMeta>) -> String {
+    match meta {
+        Some(meta) => format!(
+            "fail {label} in {} vin={} key_id={} timestamp={}",
+            format_duration(elapsed),
+            meta.vin,
+            meta.key_id,
+            meta.timestamp
+        ),
+        None => format!("fail {label} in {}", format_duration(elapsed)),
+    }
+}
+
+fn count_label(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis >= 10_000 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{millis}ms")
     }
 }
 
@@ -467,5 +689,97 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use tesdec::container::ClipHeader;
+
+    #[test]
+    fn verbose_parses_on_either_side_of_the_subcommand() {
+        let before = Cli::try_parse_from([
+            "tesdec",
+            "--verbose",
+            "decrypt",
+            "clip.mp4",
+            "--output",
+            "out",
+        ])
+        .unwrap();
+        assert!(before.verbose);
+
+        let after = Cli::try_parse_from(["tesdec", "decrypt", "-v", "-", "--output", "-"]).unwrap();
+        assert!(after.verbose);
+        match after.command {
+            Command::Decrypt(args) => {
+                assert_eq!(args.paths.len(), 1);
+                assert!(files::is_dash(&args.paths[0]));
+                assert!(args
+                    .output
+                    .as_ref()
+                    .is_some_and(|path| files::is_dash(path)));
+            }
+            _ => panic!("expected decrypt"),
+        }
+
+        let login = Cli::try_parse_from(["tesdec", "-v", "login"]).unwrap();
+        assert!(login.verbose);
+        let quiet =
+            Cli::try_parse_from(["tesdec", "decrypt", "clip.mp4", "--output", "out"]).unwrap();
+        assert!(!quiet.verbose);
+    }
+
+    #[test]
+    fn verbose_lines_name_the_clip_and_omit_key_material() {
+        let job = files::Job {
+            src: "clip.mp4".into(),
+            dest: "out.mp4".into(),
+            label: "clip.mp4".into(),
+            kind: JobKind::Decrypt(ClipHeader {
+                plaintext_size: 5000,
+                vin: "5YJ3E1EA7KF000001".into(),
+                key_id: 7,
+                timestamp: 99,
+                wrapped_key: vec![0xAB; 44],
+                public_key: vec![0x04, 0x22],
+            }),
+        };
+        let planned = plan_detail(&job, "out.mp4");
+        assert!(planned.contains("vin=5YJ3E1EA7KF000001"), "{planned}");
+        assert!(planned.contains("key_id=7"), "{planned}");
+        assert!(planned.contains("timestamp=99"), "{planned}");
+        assert!(!planned.contains("abab"), "{planned}");
+
+        let task = Task {
+            label: job.label.clone(),
+            src: job.src.clone(),
+            dest: job.dest.clone(),
+            op: TaskOp::Copy,
+            meta: clip_meta(&job),
+        };
+        let line = finish_detail(
+            &task,
+            "out.mp4",
+            5000,
+            Duration::from_millis(1500),
+            Some(16),
+        );
+        assert!(line.contains("key=16B"), "{line}");
+        assert!(line.contains("1500ms"), "{line}");
+        assert!(line.contains("vin=5YJ3E1EA7KF000001"), "{line}");
+        assert!(!line.contains("abab"), "{line}");
+
+        let failed = fail_detail(
+            "clip.mp4",
+            Duration::from_millis(12_500),
+            task.meta.as_ref(),
+        );
+        assert_eq!(
+            failed,
+            "fail clip.mp4 in 12.5s vin=5YJ3E1EA7KF000001 key_id=7 timestamp=99"
+        );
     }
 }

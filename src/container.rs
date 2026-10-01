@@ -17,11 +17,11 @@ use anyhow::{bail, Context, Result};
 use cbc::Decryptor;
 #[cfg(test)]
 use cbc::Encryptor;
+use cipher::array::Array;
 use cipher::block_padding::NoPadding;
-use cipher::generic_array::GenericArray;
-use cipher::BlockDecryptMut;
+use cipher::BlockModeDecrypt;
 #[cfg(test)]
-use cipher::BlockEncryptMut;
+use cipher::BlockModeEncrypt;
 #[cfg(test)]
 use cipher::KeyIvInit;
 use cipher::{InnerIvInit, KeyInit};
@@ -258,17 +258,17 @@ impl ScheduledKey {
             bail!("ciphertext page is not a multiple of the AES block");
         }
         let err = || anyhow::anyhow!("AES-CBC decrypt failed");
-        let iv = GenericArray::from_slice(iv);
+        let iv = Array::from(*iv);
         match self {
             Self::Aes128(cipher) => {
-                Decryptor::<Aes128>::inner_iv_init((**cipher).clone(), iv)
-                    .decrypt_padded_mut::<NoPadding>(buf)
+                Decryptor::<Aes128>::inner_iv_init((**cipher).clone(), &iv)
+                    .decrypt_padded::<NoPadding>(buf)
                     .map(|_| ())
                     .map_err(|_| err())?;
             }
             Self::Aes256(cipher) => {
-                Decryptor::<aes::Aes256>::inner_iv_init((**cipher).clone(), iv)
-                    .decrypt_padded_mut::<NoPadding>(buf)
+                Decryptor::<aes::Aes256>::inner_iv_init((**cipher).clone(), &iv)
+                    .decrypt_padded::<NoPadding>(buf)
                     .map(|_| ())
                     .map_err(|_| err())?;
             }
@@ -462,12 +462,12 @@ fn encrypt_page(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) {
     match key.len() {
         16 => {
             let enc = Encryptor::<Aes128>::new_from_slices(key, iv).unwrap();
-            enc.encrypt_padded_mut::<cipher::block_padding::NoPadding>(buf, buf.len())
+            enc.encrypt_padded::<cipher::block_padding::NoPadding>(buf, buf.len())
                 .unwrap();
         }
         32 => {
             let enc = Encryptor::<aes::Aes256>::new_from_slices(key, iv).unwrap();
-            enc.encrypt_padded_mut::<cipher::block_padding::NoPadding>(buf, buf.len())
+            enc.encrypt_padded::<cipher::block_padding::NoPadding>(buf, buf.len())
                 .unwrap();
         }
         _ => panic!("bad key"),

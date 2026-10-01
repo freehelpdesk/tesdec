@@ -16,20 +16,20 @@ default = ["webview"]
 webview = ["dep:tao", "dep:wry"]
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 anyhow = "1"
-base64 = "0.22"
-cbc = "0.1"
-cipher = "0.4"
+base64 = "0.23"
+cbc = "0.2"
+cipher = { version = "0.5", features = ["block-padding"] }
 clap = { version = "4", features = ["derive"] }
-getrandom = "0.2"
+getrandom = "0.4"
 libc = "0.2"
-md-5 = "0.10"
+md-5 = "0.11"
 open = "5"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "form", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"

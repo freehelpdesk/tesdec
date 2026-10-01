@@ -680,7 +680,7 @@ fn format_duration(secs: u64) -> String {
 impl Pkce {
     fn generate() -> Result<Self> {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes)
+        getrandom::fill(&mut bytes)
             .map_err(|err| anyhow::anyhow!("failed to generate a login secret: {err}"))?;
         let verifier = URL_SAFE_NO_PAD.encode(bytes);
         Ok(Self {
