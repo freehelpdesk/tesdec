@@ -1,0 +1,33 @@
+[package]
+name = "tesdec"
+version = "0.1.0"
+edition = "2021"
+description = "Decrypt TeslaCam clips locally with a Tesla account"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["webview"]
+# Sign-in window that captures the Tesla redirect before the dashcam site can use the code.
+webview = ["dep:tao", "dep:wry"]
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+base64 = "0.22"
+cbc = "0.1"
+cipher = "0.4"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.2"
+libc = "0.2"
+md-5 = "0.10"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
