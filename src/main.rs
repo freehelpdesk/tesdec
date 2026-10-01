@@ -6,6 +6,9 @@ mod net;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -96,6 +99,9 @@ struct DecryptArgs {
     /// Clips per key request. Tesla accepts at most 30.
     #[arg(long, default_value_t = api::MAX_BATCH)]
     batch_size: usize,
+    /// Clips to decrypt at once. The next key request runs while these finish.
+    #[arg(short = 'j', long, default_value_t = default_jobs())]
+    jobs: usize,
     /// List what would be decrypted, without calling Tesla or writing files.
     #[arg(long)]
     dry_run: bool,
@@ -139,6 +145,9 @@ fn run() -> Result<()> {
 fn decrypt(args: DecryptArgs) -> Result<()> {
     if args.batch_size == 0 || args.batch_size > api::MAX_BATCH {
         bail!("--batch-size must be from 1 to {}", api::MAX_BATCH);
+    }
+    if args.jobs == 0 {
+        bail!("--jobs must be at least 1");
     }
     let mode = files::stdio_mode(
         &args.paths,
@@ -263,106 +272,128 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         None
     };
 
-    let mut ok = 0usize;
-    let mut failed = planned.invalid.len();
-    let decrypt_jobs: Vec<_> = planned
-        .jobs
-        .iter()
-        .filter(|job| matches!(job.kind, JobKind::Decrypt(_)))
-        .collect();
-    let mut index = 0usize;
-    while index < decrypt_jobs.len() {
-        let end = (index + args.batch_size).min(decrypt_jobs.len());
-        let chunk = &decrypt_jobs[index..end];
-        index = end;
-        let items: Vec<_> = chunk
-            .iter()
-            .map(|job| match &job.kind {
-                JobKind::Decrypt(header) => api::item_for(header),
-                JobKind::Copy => unreachable!("chunk is decrypt-only"),
-            })
-            .collect();
-        let current = session.clone().context("missing Tesla session")?;
-        let fetched = match api::fetch_keys(&current.api_base, &current.access_token, &items) {
-            Ok(fetched) => fetched,
-            Err(FetchError::Unauthorized) => {
-                if args.token.is_some() {
-                    bail!("Tesla rejected --token. Sign in with `tesdec login` or pass a fresh token.");
+    let ok = AtomicUsize::new(0);
+    let failed_tasks = AtomicUsize::new(0);
+    let mut failed_now = planned.invalid.len();
+    let threads = args.jobs.min(planned.jobs.len().max(1));
+    let to_stdout = mode.to_stdout;
+    // The queue outlives the worker threads. `scope` joins them before returning.
+    let (tx, rx) = mpsc::channel();
+    let rx = Mutex::new(rx);
+
+    thread::scope(|scope| -> Result<()> {
+        for _ in 0..threads {
+            let rx = &rx;
+            let ok = &ok;
+            let failed_tasks = &failed_tasks;
+            scope.spawn(move || {
+                loop {
+                    // Hold the mutex only while waiting for the next clip, then
+                    // decrypt outside it so the other workers can take work.
+                    let task = {
+                        let guard = rx.lock().unwrap_or_else(|err| err.into_inner());
+                        match guard.recv() {
+                            Ok(task) => task,
+                            Err(_) => break,
+                        }
+                    };
+                    execute_task(task, to_stdout, ok, failed_tasks);
                 }
-                eprintln!("Access token was rejected. Refreshing…");
-                let refreshed = auth::refresh_session(&current)?;
-                let fetched =
-                    match api::fetch_keys(&refreshed.api_base, &refreshed.access_token, &items) {
-                        Ok(fetched) => fetched,
-                        Err(FetchError::Unauthorized) => {
-                            bail!(
+            });
+        }
+
+        let decrypt_jobs: Vec<_> = planned
+            .jobs
+            .iter()
+            .filter(|job| matches!(job.kind, JobKind::Decrypt(_)))
+            .collect();
+        let mut index = 0usize;
+        while index < decrypt_jobs.len() {
+            let end = (index + args.batch_size).min(decrypt_jobs.len());
+            let chunk = &decrypt_jobs[index..end];
+            index = end;
+            let items: Vec<_> = chunk
+                .iter()
+                .map(|job| match &job.kind {
+                    JobKind::Decrypt(header) => api::item_for(header),
+                    JobKind::Copy => unreachable!("chunk is decrypt-only"),
+                })
+                .collect();
+            let current = session.clone().context("missing Tesla session")?;
+            let fetched = match api::fetch_keys(&current.api_base, &current.access_token, &items) {
+                Ok(fetched) => fetched,
+                Err(FetchError::Unauthorized) => {
+                    if args.token.is_some() {
+                        bail!(
+                            "Tesla rejected --token. Sign in with `tesdec login` or pass a fresh token."
+                        );
+                    }
+                    eprintln!("Access token was rejected. Refreshing…");
+                    let refreshed = auth::refresh_session(&current)?;
+                    let fetched =
+                        match api::fetch_keys(&refreshed.api_base, &refreshed.access_token, &items)
+                        {
+                            Ok(fetched) => fetched,
+                            Err(FetchError::Unauthorized) => {
+                                bail!(
                                 "Tesla still rejected the token after refresh. Run `tesdec login`."
                             )
-                        }
-                        Err(FetchError::Failed(message)) => bail!("{message}"),
-                    };
-                session = Some(refreshed);
-                fetched
-            }
-            Err(FetchError::Failed(message)) => {
-                eprintln!("error: {message}");
-                failed += chunk.len();
-                continue;
-            }
-        };
-        let mut errors = std::collections::HashMap::new();
-        for (id, message) in fetched.errors {
-            errors.insert(id, message);
-        }
-        for (job, item) in chunk.iter().zip(items.iter()) {
-            if let Some(message) = errors.get(&item.id) {
-                eprintln!("error: {} — {message}", job.label);
-                failed += 1;
-                continue;
-            }
-            let Some(key) = fetched.keys.get(&item.id) else {
-                eprintln!("error: {} — Tesla did not return a key", job.label);
-                failed += 1;
-                continue;
+                            }
+                            Err(FetchError::Failed(message)) => bail!("{message}"),
+                        };
+                    session = Some(refreshed);
+                    fetched
+                }
+                Err(FetchError::Failed(message)) => {
+                    eprintln!("error: {message}");
+                    failed_now += chunk.len();
+                    continue;
+                }
             };
-            match container::decrypt_file(&job.src, &job.dest, key) {
-                Ok(bytes) => {
-                    note(&format!(
-                        "decrypted  {} -> {} ({})",
-                        job.label,
-                        dest_label(&job.dest),
-                        format_bytes(bytes)
-                    ));
-                    ok += 1;
+            let mut errors = std::collections::HashMap::new();
+            for (id, message) in fetched.errors {
+                errors.insert(id, message);
+            }
+            for (job, item) in chunk.iter().zip(items.iter()) {
+                if let Some(message) = errors.get(&item.id) {
+                    eprintln!("error: {} — {message}", job.label);
+                    failed_now += 1;
+                    continue;
                 }
-                Err(err) => {
-                    eprintln!("error: {} — {err:#}", job.label);
-                    failed += 1;
-                }
+                let Some(key) = fetched.keys.get(&item.id) else {
+                    eprintln!("error: {} — Tesla did not return a key", job.label);
+                    failed_now += 1;
+                    continue;
+                };
+                tx.send(Task {
+                    label: job.label.clone(),
+                    src: job.src.clone(),
+                    dest: job.dest.clone(),
+                    op: TaskOp::Decrypt(key.clone()),
+                })
+                .context("decrypt worker stopped")?;
             }
         }
-    }
 
-    for job in planned
-        .jobs
-        .iter()
-        .filter(|job| matches!(job.kind, JobKind::Copy))
-    {
-        match files::copy_file(&job.src, &job.dest) {
-            Ok(_) => {
-                note(&format!(
-                    "copied  {} -> {}",
-                    job.label,
-                    dest_label(&job.dest)
-                ));
-                ok += 1;
-            }
-            Err(err) => {
-                eprintln!("error: {} — {err:#}", job.label);
-                failed += 1;
-            }
+        for job in planned
+            .jobs
+            .iter()
+            .filter(|job| matches!(job.kind, JobKind::Copy))
+        {
+            tx.send(Task {
+                label: job.label.clone(),
+                src: job.src.clone(),
+                dest: job.dest.clone(),
+                op: TaskOp::Copy,
+            })
+            .context("decrypt worker stopped")?;
         }
-    }
+        drop(tx);
+        Ok(())
+    })?;
+
+    let ok = ok.load(Ordering::Relaxed);
+    let failed = failed_now + failed_tasks.load(Ordering::Relaxed);
 
     if mode.to_stdout && ok == 1 {
         let mut stdout = std::io::stdout().lock();
@@ -377,6 +408,59 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         bail!("{failed} file(s) failed");
     }
     Ok(())
+}
+
+struct Task {
+    label: String,
+    src: PathBuf,
+    dest: PathBuf,
+    op: TaskOp,
+}
+
+enum TaskOp {
+    Decrypt(Vec<u8>),
+    Copy,
+}
+
+fn default_jobs() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+fn execute_task(task: Task, to_stdout: bool, ok: &AtomicUsize, failed: &AtomicUsize) {
+    let show = |line: String| {
+        if !to_stdout {
+            println!("{line}");
+        }
+    };
+    match task.op {
+        TaskOp::Decrypt(key) => match container::decrypt_file(&task.src, &task.dest, &key) {
+            Ok(bytes) => {
+                show(format!(
+                    "decrypted  {} -> {} ({})",
+                    task.label,
+                    task.dest.display(),
+                    format_bytes(bytes)
+                ));
+                ok.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                eprintln!("error: {} — {err:#}", task.label);
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        TaskOp::Copy => match files::copy_file(&task.src, &task.dest) {
+            Ok(_) => {
+                show(format!("copied  {} -> {}", task.label, task.dest.display()));
+                ok.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                eprintln!("error: {} — {err:#}", task.label);
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

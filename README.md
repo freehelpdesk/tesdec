@@ -58,7 +58,7 @@ Plain MP4s in a folder are copied into `--output` and left alone with `--in-plac
 
 `--in-place` writes a temp file beside the clip and renames it over the original, so a failed decrypt leaves the encrypted file in place. The disk needs room for the decrypted copy. If the USB stick is full, use `--output` on another drive.
 
-`--dry-run` lists the plan and does not call Tesla. `--token` uses a bearer token you already have and does not save it. `--batch-size` defaults to 30, which is Tesla's maximum. Larger folders are split across several key requests.
+`--dry-run` lists the plan and does not call Tesla. `--token` uses a bearer token you already have and does not save it. `--batch-size` defaults to 30, which is Tesla's maximum. Larger folders are split across several key requests. `-j` / `--jobs` decrypts that many clips at once (default: the number of CPUs). The next key request is sent while those clips are still decrypting.
 
 ## What Tesla receives
 

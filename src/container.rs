@@ -480,6 +480,42 @@ mod tests {
     }
 
     #[test]
+    fn several_threads_decrypt_separate_clips() {
+        let key = [0x11u8; 16];
+        let mut plain = vec![0u8; 5000];
+        plain[4..8].copy_from_slice(b"ftyp");
+        plain[8..12].copy_from_slice(b"isom");
+        for (i, byte) in plain.iter_mut().enumerate().skip(12) {
+            *byte = (i % 251) as u8;
+        }
+        let sealed = seal(&plain, &key, "5YJ3E1EA7KF000001", 7, 1_700_000_123);
+        let dir = std::env::temp_dir().join(format!(
+            "tesdec-par-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..4 {
+                let src = dir.join(format!("clip-{i}.mp4"));
+                let dest = dir.join(format!("out-{i}.mp4"));
+                fs::write(&src, &sealed).unwrap();
+                let plain = &plain;
+                scope.spawn(move || {
+                    let n = decrypt_file(&src, &dest, &key).unwrap();
+                    assert_eq!(n, plain.len() as u64);
+                    assert_eq!(fs::read(&dest).unwrap(), *plain);
+                });
+            }
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shorter_public_key_is_read_the_way_the_viewer_does() {
         let mut header = vec![0u8; HEADER_SIZE];
         let file_len = (HEADER_SIZE + PAGE_SIZE) as u64;
