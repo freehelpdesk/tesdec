@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! Tesla 2026.20 dashcam container.
 //!
 //! The layout and page cipher match the unminified `encryptfs` bundle shipped

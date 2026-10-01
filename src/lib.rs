@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! Decrypt TeslaCam clips. The `tesdec` binary is a command-line wrapper
 //! around this crate. C and C++ programs link the same build and include
 //! `include/tesdec.h`.

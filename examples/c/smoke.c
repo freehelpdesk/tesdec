@@ -1,3 +1,7 @@
+/* Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+ * See the LICENSE file in the repository root.
+ */
+
 #include "tesdec.h"
 
 #include <stddef.h>

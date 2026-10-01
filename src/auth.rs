@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! Tesla OAuth for the public `dashcam` client used by dashcam.tesla.com.
 //!
 //! The browser window (or the pasted callback) only completes Tesla's PKCE

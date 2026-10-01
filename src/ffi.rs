@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! C ABI for programs that link `libtesdec`.
 //!
 //! The layout of every `#[repr(C)]` struct is checked against

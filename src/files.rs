@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! Discover clips in files and directories, and decide where decrypted output goes.
 
 use std::collections::HashMap;

@@ -1,3 +1,6 @@
+//! Copyright (c) 2026 freehelpdesk. Licensed under the MIT License.
+//! See the LICENSE file in the repository root.
+//!
 //! Key requests to dashcam.tesla.com.
 //!
 //! The official viewer posts ownership metadata from each clip header and gets
