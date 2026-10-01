@@ -1,9 +1,3 @@
-mod api;
-mod auth;
-mod container;
-mod files;
-mod net;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,9 +6,12 @@ use std::thread;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-
-use crate::api::FetchError;
-use crate::files::JobKind;
+use tesdec::api;
+use tesdec::api::FetchError;
+use tesdec::auth;
+use tesdec::container;
+use tesdec::files;
+use tesdec::files::JobKind;
 
 #[derive(Parser)]
 #[command(

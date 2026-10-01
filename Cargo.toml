@@ -6,6 +6,10 @@ description = "Decrypt TeslaCam clips locally with a Tesla account"
 license = "MIT"
 readme = "README.md"
 
+[lib]
+name = "tesdec"
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [features]
 default = ["webview"]
 # Sign-in window that captures the Tesla redirect before the dashcam site can use the code.

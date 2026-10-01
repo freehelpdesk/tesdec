@@ -12,6 +12,23 @@ cargo build --release
 
 The binary is `target/release/tesdec`. `cargo install --path .` installs it onto your `PATH`.
 
+The same build writes a library other programs can link:
+
+| File | Use |
+| --- | --- |
+| `target/release/libtesdec.rlib` | Rust (`tesdec = { path = "..." }`) |
+| `target/release/libtesdec.dylib` | C and C++ shared library (`.so` on Linux, `.dll` on Windows) |
+| `target/release/libtesdec.a` | C and C++ static library |
+
+The C header is [`include/tesdec.h`](include/tesdec.h). Rust callers use `decrypt_file`, `probe`, `fetch_keys`, and the `auth` module. The C functions are probe, decrypt-with-key, and fetch-keys. They do not open the sign-in window; pass a bearer token. A Rust dependency that does not call `login` can set `default-features = false` and leave the webview out.
+
+```bash
+clang -I include -L target/release -ltesdec examples/c/smoke.c -o smoke
+DYLD_LIBRARY_PATH=target/release ./smoke
+```
+
+On Linux use `LD_LIBRARY_PATH`. A static link also needs the system libraries Rust uses (`cargo rustc --release --crate-type staticlib -- --print native-static-libs`).
+
 ## Sign in
 
 ```bash

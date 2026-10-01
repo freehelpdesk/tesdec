@@ -23,7 +23,7 @@ pub const REDIRECT_URI: &str = "https://dashcam.tesla.com/callback";
 /// Scopes the official viewer requests. `employee` is part of that list.
 pub const SCOPE: &str = "openid profile email employee";
 const DEFAULT_AUTH: &str = "https://auth.tesla.com";
-const DEFAULT_API: &str = "https://dashcam.tesla.com";
+pub const API_BASE: &str = "https://dashcam.tesla.com";
 const EXPIRY_SKEW_SECS: u64 = 120;
 
 #[derive(Clone, Debug)]
@@ -47,7 +47,7 @@ impl Endpoints {
             },
         };
         let api_base = api_base
-            .unwrap_or(DEFAULT_API)
+            .unwrap_or(API_BASE)
             .trim_end_matches('/')
             .to_string();
         Ok(Self {
@@ -512,7 +512,7 @@ pub fn session_for(token_override: Option<&str>, api_override: Option<&str>) -> 
         return Ok(Session {
             access_token: token.to_string(),
             api_base: api_override
-                .unwrap_or(DEFAULT_API)
+                .unwrap_or(API_BASE)
                 .trim_end_matches('/')
                 .to_string(),
         });
