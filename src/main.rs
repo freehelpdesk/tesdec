@@ -27,6 +27,8 @@ Examples:
   tesdec decrypt /Volumes/TESLA/TeslaCam --output ~/TeslaCam-plain
   tesdec decrypt clip.mp4 other.mp4 --output ~/out --overwrite
   tesdec decrypt /Volumes/TESLA/TeslaCam --in-place
+  tesdec decrypt - < clip.mp4 > plain.mp4
+  tesdec decrypt clip.mp4 --output -
 "
 )]
 struct Cli {
@@ -70,11 +72,11 @@ struct LoginArgs {
 
 #[derive(clap::Args)]
 struct DecryptArgs {
-    /// Files or directories. Directories are scanned recursively for .mp4 clips.
+    /// Files or directories. `-` reads one clip from stdin. Directories are scanned recursively for .mp4 clips.
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    /// Write decrypted clips here, keeping paths relative to each input directory.
-    #[arg(short, long, conflicts_with = "in_place")]
+    /// Directory for decrypted clips, or `-` to write one clip to stdout.
+    #[arg(short, long, conflicts_with = "in_place", allow_hyphen_values = true)]
     output: Option<PathBuf>,
     /// Replace each encrypted clip with the decrypted MP4.
     #[arg(long)]
@@ -103,11 +105,13 @@ struct DecryptArgs {
 }
 
 fn main() -> ExitCode {
-    if let Err(err) = run() {
-        eprintln!("error: {err:#}");
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) if files::is_broken_pipe(&err) => ExitCode::from(1),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -136,22 +140,86 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
     if args.batch_size == 0 || args.batch_size > api::MAX_BATCH {
         bail!("--batch-size must be from 1 to {}", api::MAX_BATCH);
     }
-    let planned = files::plan(files::Options {
-        inputs: &args.paths,
-        output: args.output.as_deref(),
+    let mode = files::stdio_mode(
+        &args.paths,
+        args.output.as_deref(),
+        args.in_place,
+        args.mirror,
+    )?;
+    // Stdin is not a file until it is spooled: the header check needs a length.
+    let spool = if mode.from_stdin {
+        Some(files::spool_stdin()?)
+    } else {
+        None
+    };
+    let inputs: Vec<PathBuf> = if let Some(spool) = &spool {
+        vec![spool.file.clone()]
+    } else {
+        args.paths.clone()
+    };
+    let stdout_scratch = if mode.to_stdout {
+        Some(files::TempTree::create("tesdec-stdout")?)
+    } else {
+        None
+    };
+    let output_buf = if let Some(scratch) = &stdout_scratch {
+        Some(scratch.path().to_path_buf())
+    } else {
+        args.output.clone()
+    };
+    let mut planned = files::plan(files::Options {
+        inputs: &inputs,
+        output: output_buf.as_deref(),
         in_place: args.in_place,
         overwrite: args.overwrite,
         mirror: args.mirror,
+        label_stdin: mode.from_stdin,
     })?;
+    if let Some(spool) = &spool {
+        let raw = spool.file.display().to_string();
+        for note in &mut planned.invalid {
+            *note = note.replace(&raw, "stdin");
+        }
+        for note in &mut planned.skipped {
+            *note = note.replace(&raw, "stdin");
+        }
+    }
+    if mode.to_stdout && planned.jobs.len() > 1 {
+        bail!(
+            "stdout can receive only one clip, found {}",
+            planned.jobs.len()
+        );
+    }
+
+    // MP4 bytes own stdout. Status stays on stderr, and a successful pipe is quiet.
+    let emit = |line: &str| {
+        if mode.to_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+    let note = |line: &str| {
+        if !mode.to_stdout || args.dry_run {
+            emit(line);
+        }
+    };
+    let dest_label = |dest: &std::path::Path| -> String {
+        if mode.to_stdout {
+            "stdout".to_string()
+        } else {
+            dest.display().to_string()
+        }
+    };
 
     for note in &planned.skipped {
-        println!("skip  {note}");
+        emit(&format!("skip  {note}"));
     }
     for note in &planned.invalid {
         eprintln!("error: {note}");
     }
     if planned.jobs.is_empty() && planned.invalid.is_empty() {
-        println!("No clips to decrypt.");
+        emit("No clips to decrypt.");
         return Ok(());
     }
     if args.dry_run {
@@ -160,14 +228,18 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
                 JobKind::Decrypt(_) => "decrypt",
                 JobKind::Copy => "copy",
             };
-            println!("{action}  {} -> {}", job.label, job.dest.display());
+            emit(&format!(
+                "{action}  {} -> {}",
+                job.label,
+                dest_label(&job.dest)
+            ));
         }
-        println!(
+        emit(&format!(
             "{} file(s) ready, {} skipped, {} unreadable.",
             planned.jobs.len(),
             planned.skipped.len(),
             planned.invalid.len()
-        );
+        ));
         if !planned.invalid.is_empty() {
             bail!("{} file(s) could not be read", planned.invalid.len());
         }
@@ -255,12 +327,12 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
             };
             match container::decrypt_file(&job.src, &job.dest, key) {
                 Ok(bytes) => {
-                    println!(
+                    note(&format!(
                         "decrypted  {} -> {} ({})",
                         job.label,
-                        job.dest.display(),
+                        dest_label(&job.dest),
                         format_bytes(bytes)
-                    );
+                    ));
                     ok += 1;
                 }
                 Err(err) => {
@@ -278,7 +350,11 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
     {
         match files::copy_file(&job.src, &job.dest) {
             Ok(_) => {
-                println!("copied  {} -> {}", job.label, job.dest.display());
+                note(&format!(
+                    "copied  {} -> {}",
+                    job.label,
+                    dest_label(&job.dest)
+                ));
                 ok += 1;
             }
             Err(err) => {
@@ -288,10 +364,15 @@ fn decrypt(args: DecryptArgs) -> Result<()> {
         }
     }
 
-    println!(
+    if mode.to_stdout && ok == 1 {
+        let mut stdout = std::io::stdout().lock();
+        files::copy_bytes_to(&planned.jobs[0].dest, &mut stdout, "stdout")?;
+    }
+
+    note(&format!(
         "Done. {ok} written, {} skipped, {failed} failed.",
         planned.skipped.len()
-    );
+    ));
     if failed > 0 {
         bail!("{failed} file(s) failed");
     }

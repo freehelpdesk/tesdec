@@ -46,9 +46,15 @@ tesdec decrypt ./TeslaCam --output ~/TeslaCam-plain --overwrite
 
 # Replace the encrypted clips on disk. Asks for confirmation unless --yes.
 tesdec decrypt /Volumes/TESLA/TeslaCam --in-place
+
+# One clip on stdin, decrypted MP4 on stdout. Status stays on stderr.
+tesdec decrypt - < clip.mp4 > plain.mp4
+tesdec decrypt clip.mp4 --output -
 ```
 
 Plain MP4s in a folder are copied into `--output` and left alone with `--in-place`. `--mirror` also copies the other files (event JSON, thumbnails). Existing output files are skipped unless `--overwrite`.
+
+`-` reads one clip from stdin. With no `--output`, that clip is written to stdout. `--output <DIR>` saves it as `stdin.mp4`. `--output -` writes one file or one stdin clip to stdout. A successful pipe receives only MP4 bytes; errors and `--dry-run` stay on stderr. Stdin is copied to a temp file first because the container length is checked before the key request. A folder that contains more than one clip cannot be written to stdout. `--in-place` and `--mirror` do not apply to a pipe.
 
 `--in-place` writes a temp file beside the clip and renames it over the original, so a failed decrypt leaves the encrypted file in place. The disk needs room for the decrypted copy. If the USB stick is full, use `--output` on another drive.
 

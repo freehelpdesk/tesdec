@@ -1,8 +1,8 @@
 //! Discover clips in files and directories, and decide where decrypted output goes.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -38,6 +38,53 @@ pub struct Options<'a> {
     pub in_place: bool,
     pub overwrite: bool,
     pub mirror: bool,
+    /// Label an explicit stdin spool as `-` instead of its temp path.
+    pub label_stdin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdioMode {
+    pub from_stdin: bool,
+    pub to_stdout: bool,
+}
+
+pub fn is_dash(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// `-` is one clip on stdin, or one decrypted MP4 on stdout.
+///
+/// `tesdec decrypt -` writes stdout. `tesdec decrypt clip.mp4 --output -` does
+/// the same for a file. A directory still has to be expanded before stdout is
+/// rejected for more than one clip.
+pub fn stdio_mode(
+    paths: &[PathBuf],
+    output: Option<&Path>,
+    in_place: bool,
+    mirror: bool,
+) -> Result<StdioMode> {
+    let dash_inputs = paths.iter().filter(|path| is_dash(path)).count();
+    if dash_inputs > 1 || (dash_inputs == 1 && paths.len() != 1) {
+        bail!("`-` reads one clip from stdin; do not combine it with other paths");
+    }
+    let from_stdin = dash_inputs == 1;
+    let to_stdout = output.is_some_and(is_dash) || (from_stdin && output.is_none() && !in_place);
+    if in_place && from_stdin {
+        bail!("stdin has no path to replace; choose --output <DIR> or write to stdout");
+    }
+    if in_place && to_stdout {
+        bail!("--in-place replaces files where they are, so it cannot write to stdout");
+    }
+    if mirror && to_stdout {
+        bail!("--mirror copies a folder of files, so it cannot write to stdout");
+    }
+    if to_stdout && !from_stdin && paths.len() != 1 {
+        bail!("stdout can receive only one clip");
+    }
+    Ok(StdioMode {
+        from_stdin,
+        to_stdout,
+    })
 }
 
 pub fn plan(opts: Options<'_>) -> Result<Plan> {
@@ -51,7 +98,9 @@ pub fn plan(opts: Options<'_>) -> Result<Plan> {
         bail!("--mirror copies the rest of a folder, so it needs --output");
     }
     if !opts.in_place && opts.output.is_none() {
-        bail!("choose --output <DIR> to write a new copy, or --in-place to replace the encrypted clips");
+        bail!(
+            "choose --output <DIR> to write a new copy, --output - to write one clip to stdout, or --in-place to replace the encrypted clips"
+        );
     }
 
     let multiple = opts.inputs.len() > 1;
@@ -148,7 +197,7 @@ fn consider_file(
     };
 
     let dest = destination(root, path, opts, multiple, explicit_file)?;
-    let label = label_for(root, path, multiple, explicit_file);
+    let label = label_for(root, path, multiple, explicit_file, opts.label_stdin);
     if !opts.in_place && !opts.overwrite && dest.exists() && !same_file(&dest, path) {
         plan.skipped
             .push(format!("{label}: already exists at {}", dest.display()));
@@ -212,8 +261,17 @@ fn destination(
     }
 }
 
-fn label_for(root: &Path, path: &Path, multiple: bool, explicit_file: bool) -> String {
+fn label_for(
+    root: &Path,
+    path: &Path,
+    multiple: bool,
+    explicit_file: bool,
+    label_stdin: bool,
+) -> String {
     if explicit_file {
+        if label_stdin {
+            return "-".to_string();
+        }
         return path.display().to_string();
     }
     let rel = path
@@ -251,6 +309,94 @@ pub fn copy_file(src: &Path, dest: &Path) -> Result<u64> {
         .with_context(|| format!("cannot copy {} to {}", src.display(), tmp.display()))?;
     fs::rename(&tmp, dest).with_context(|| format!("cannot move copy into {}", dest.display()))?;
     Ok(bytes)
+}
+
+/// Copy decrypted bytes to `dest`. Used for stdout, where only the MP4 belongs.
+pub fn copy_bytes_to(src: &Path, dest: &mut impl Write, dest_label: &str) -> Result<u64> {
+    let mut input = File::open(src).with_context(|| format!("cannot read {}", src.display()))?;
+    let n = io::copy(&mut input, dest)
+        .with_context(|| format!("cannot write decrypted bytes to {dest_label}"))?;
+    dest.flush()
+        .with_context(|| format!("cannot flush {dest_label}"))?;
+    Ok(n)
+}
+
+pub fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Directory removed when dropped. Holds a stdin spool or a stdout scratch file.
+pub struct TempTree {
+    path: PathBuf,
+}
+
+impl TempTree {
+    pub fn create(prefix: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub struct SpooledStdin {
+    dir: PathBuf,
+    pub file: PathBuf,
+}
+
+impl Drop for SpooledStdin {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Read one clip from `reader` into a temp `.mp4` so the container length can be checked.
+pub fn spool_reader(mut reader: impl Read) -> Result<SpooledStdin> {
+    let dir = std::env::temp_dir().join(format!(
+        "tesdec-stdin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let spooled = SpooledStdin {
+        file: dir.join("stdin.mp4"),
+        dir,
+    };
+    let mut out = File::create(&spooled.file)
+        .with_context(|| format!("cannot create {}", spooled.file.display()))?;
+    let n = io::copy(&mut reader, &mut out).context("cannot read stdin")?;
+    out.flush().context("cannot write the stdin spool")?;
+    if n == 0 {
+        bail!("stdin was empty");
+    }
+    Ok(spooled)
+}
+
+pub fn spool_stdin() -> Result<SpooledStdin> {
+    spool_reader(io::stdin().lock())
 }
 
 pub fn confirm_in_place(jobs: &[Job], yes: bool) -> Result<()> {
@@ -339,6 +485,7 @@ mod tests {
             in_place: false,
             overwrite: false,
             mirror: false,
+            label_stdin: false,
         })
         .unwrap();
         assert!(planned.jobs.iter().any(|job| job.label == "plain.mp4"));
@@ -357,6 +504,7 @@ mod tests {
             in_place: false,
             overwrite: true,
             mirror: true,
+            label_stdin: false,
         })
         .unwrap();
         assert!(mirrored
@@ -388,11 +536,106 @@ mod tests {
             in_place: false,
             overwrite: false,
             mirror: false,
+            label_stdin: false,
         })
         .unwrap();
         let labels: Vec<_> = planned.jobs.iter().map(|job| job.dest.clone()).collect();
         assert!(labels.contains(&out.join("TeslaCam/recent.mp4")));
         assert!(labels.contains(&out.join("clip.mp4")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dash_selects_stdin_and_stdout() {
+        let file = PathBuf::from("clip.mp4");
+        let other = PathBuf::from("other.mp4");
+        let dir = PathBuf::from("/tmp/out");
+        assert_eq!(
+            stdio_mode(&[PathBuf::from("-")], None, false, false).unwrap(),
+            StdioMode {
+                from_stdin: true,
+                to_stdout: true,
+            }
+        );
+        assert_eq!(
+            stdio_mode(&[PathBuf::from("-")], Some(&dir), false, false).unwrap(),
+            StdioMode {
+                from_stdin: true,
+                to_stdout: false,
+            }
+        );
+        assert_eq!(
+            stdio_mode(
+                std::slice::from_ref(&file),
+                Some(Path::new("-")),
+                false,
+                false
+            )
+            .unwrap(),
+            StdioMode {
+                from_stdin: false,
+                to_stdout: true,
+            }
+        );
+        assert_eq!(
+            stdio_mode(std::slice::from_ref(&file), Some(&dir), false, false).unwrap(),
+            StdioMode {
+                from_stdin: false,
+                to_stdout: false,
+            }
+        );
+        assert!(stdio_mode(&[PathBuf::from("-"), other.clone()], None, false, false).is_err());
+        assert!(stdio_mode(&[PathBuf::from("-")], None, true, false).is_err());
+        assert!(stdio_mode(
+            std::slice::from_ref(&file),
+            Some(Path::new("-")),
+            false,
+            true
+        )
+        .is_err());
+        assert!(stdio_mode(&[file, other], Some(Path::new("-")), false, false).is_err());
+    }
+
+    #[test]
+    fn stdin_spool_is_one_labeled_clip_and_is_removed() {
+        let root = scratch("spool");
+        let sealed_path = sealed(&root, "clip.mp4");
+        let bytes = fs::read(&sealed_path).unwrap();
+        let spooled = spool_reader(std::io::Cursor::new(bytes)).unwrap();
+        let dir = spooled.dir.clone();
+        let out = root.join("out");
+        let inputs = [spooled.file.clone()];
+        let planned = plan(Options {
+            inputs: &inputs,
+            output: Some(&out),
+            in_place: false,
+            overwrite: false,
+            mirror: false,
+            label_stdin: true,
+        })
+        .unwrap();
+        assert_eq!(planned.jobs.len(), 1);
+        assert_eq!(planned.jobs[0].label, "-");
+        assert_eq!(planned.jobs[0].dest, out.join("stdin.mp4"));
+        assert!(matches!(planned.jobs[0].kind, JobKind::Decrypt(_)));
+        drop(spooled);
+        assert!(!dir.exists());
+        assert!(spool_reader(std::io::Cursor::new([])).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_bytes_to_writes_the_file_unchanged() {
+        let root = scratch("bytes");
+        let src = root.join("plain.mp4");
+        fs::write(&src, b"\0\0\0\x18ftypisom").unwrap();
+        let mut out = Vec::new();
+        let n = copy_bytes_to(&src, &mut out, "stdout").unwrap();
+        assert_eq!(n, out.len() as u64);
+        assert_eq!(out, b"\0\0\0\x18ftypisom");
+        let err = anyhow::Error::from(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            .context("cannot write decrypted bytes to stdout");
+        assert!(is_broken_pipe(&err));
         let _ = fs::remove_dir_all(&root);
     }
 }
