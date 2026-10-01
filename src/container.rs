@@ -7,8 +7,9 @@
 //! Pages are full blocks with no padding; the header's plaintext length trims
 //! the tail.
 
+use std::cell::RefCell;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use aes::Aes128;
@@ -16,10 +17,14 @@ use anyhow::{bail, Context, Result};
 use cbc::Decryptor;
 #[cfg(test)]
 use cbc::Encryptor;
+use cipher::block_padding::NoPadding;
+use cipher::generic_array::GenericArray;
 use cipher::BlockDecryptMut;
 #[cfg(test)]
 use cipher::BlockEncryptMut;
+#[cfg(test)]
 use cipher::KeyIvInit;
+use cipher::{InnerIvInit, KeyInit};
 use md5::{Digest, Md5};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -179,43 +184,106 @@ pub fn parse_container(header: &[u8], file_len: u64) -> Result<ClipHeader> {
     })
 }
 
+#[cfg(test)]
 pub fn derive_iv(file_key: &[u8], page: u64) -> [u8; 16] {
-    let root = Md5::digest(file_key);
-    let mut material = [0u8; 32];
-    material[..16].copy_from_slice(&root);
-    let digits = page.to_string();
-    let bytes = digits.as_bytes();
-    // Sixteen bytes remain in the 32-byte buffer. A clip would need an absurd
-    // page index (10^16 pages) to overflow it.
-    let n = bytes.len().min(16);
-    material[16..16 + n].copy_from_slice(&bytes[..n]);
-    let out = Md5::digest(material);
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(&out);
-    iv
+    IvGen::new(file_key).iv(page)
 }
 
-fn decrypt_page(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> Result<()> {
-    if !buf.len().is_multiple_of(16) {
-        bail!("ciphertext page is not a multiple of the AES block");
+/// MD5(file key) once per clip. The per-page IV is a second MD5 over that
+/// digest, the ASCII page number, and zeros.
+struct IvGen {
+    root: [u8; 16],
+}
+
+impl IvGen {
+    fn new(file_key: &[u8]) -> Self {
+        let digest = Md5::digest(file_key);
+        let mut root = [0u8; 16];
+        root.copy_from_slice(&digest);
+        Self { root }
     }
-    let err = || anyhow::anyhow!("AES-CBC decrypt failed");
-    match key.len() {
-        16 => {
-            let dec = Decryptor::<Aes128>::new_from_slices(key, iv).map_err(|_| err())?;
-            dec.decrypt_padded_mut::<cipher::block_padding::NoPadding>(buf)
-                .map(|_| ())
-                .map_err(|_| err())?;
-        }
-        32 => {
-            let dec = Decryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|_| err())?;
-            dec.decrypt_padded_mut::<cipher::block_padding::NoPadding>(buf)
-                .map(|_| ())
-                .map_err(|_| err())?;
-        }
-        other => bail!("Tesla returned a {other}-byte key; expected 16 or 32"),
+
+    fn iv(&self, page: u64) -> [u8; 16] {
+        let mut material = [0u8; 32];
+        material[..16].copy_from_slice(&self.root);
+        // Sixteen bytes remain. A real clip never has 10^16 pages.
+        let _ = write_u64_ascii(page, &mut material[16..]);
+        let out = Md5::digest(material);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&out);
+        iv
     }
-    Ok(())
+}
+
+fn write_u64_ascii(mut value: u64, dest: &mut [u8]) -> usize {
+    if value == 0 {
+        dest[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    while value > 0 {
+        tmp[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    let n = len.min(dest.len());
+    for i in 0..n {
+        dest[i] = tmp[len - 1 - i];
+    }
+    n
+}
+
+/// AES key schedule, built once per clip. Each page only swaps in a new IV.
+enum ScheduledKey {
+    Aes128(Box<Aes128>),
+    Aes256(Box<aes::Aes256>),
+}
+
+impl ScheduledKey {
+    fn new(key: &[u8]) -> Result<Self> {
+        match key.len() {
+            16 => Ok(Self::Aes128(Box::new(
+                Aes128::new_from_slice(key).expect("length checked"),
+            ))),
+            32 => Ok(Self::Aes256(Box::new(
+                aes::Aes256::new_from_slice(key).expect("length checked"),
+            ))),
+            other => bail!("Tesla returned a {other}-byte key; expected 16 or 32"),
+        }
+    }
+
+    fn decrypt_page(&self, iv: &[u8; 16], buf: &mut [u8]) -> Result<()> {
+        if !buf.len().is_multiple_of(16) {
+            bail!("ciphertext page is not a multiple of the AES block");
+        }
+        let err = || anyhow::anyhow!("AES-CBC decrypt failed");
+        let iv = GenericArray::from_slice(iv);
+        match self {
+            Self::Aes128(cipher) => {
+                Decryptor::<Aes128>::inner_iv_init((**cipher).clone(), iv)
+                    .decrypt_padded_mut::<NoPadding>(buf)
+                    .map(|_| ())
+                    .map_err(|_| err())?;
+            }
+            Self::Aes256(cipher) => {
+                Decryptor::<aes::Aes256>::inner_iv_init((**cipher).clone(), iv)
+                    .decrypt_padded_mut::<NoPadding>(buf)
+                    .map(|_| ())
+                    .map_err(|_| err())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One mebibyte. Large enough that a NAS round trip carries many pages, small
+/// enough that every worker can keep a buffer.
+const CHUNK_PAGES: usize = 256;
+const CHUNK_BYTES: usize = PAGE_SIZE * CHUNK_PAGES;
+
+thread_local! {
+    static CHUNK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Decrypt `src` to `dest`. Writes a sibling temp file and renames it into
@@ -224,8 +292,8 @@ pub fn decrypt_file(src: &Path, dest: &Path, key: &[u8]) -> Result<u64> {
     let file_len = fs::metadata(src)
         .with_context(|| format!("cannot stat {}", src.display()))?
         .len();
-    let mut input =
-        BufReader::new(File::open(src).with_context(|| format!("cannot open {}", src.display()))?);
+    let mut input = File::open(src).with_context(|| format!("cannot open {}", src.display()))?;
+    advise_sequential(&input);
     let mut header = vec![0u8; HEADER_SIZE];
     input
         .read_exact(&mut header)
@@ -241,41 +309,56 @@ pub fn decrypt_file(src: &Path, dest: &Path, key: &[u8]) -> Result<u64> {
     }
     let tmp = temp_path_for(dest);
     let guard = TempGuard(Some(tmp.clone()));
-    let mut output = BufWriter::new(
-        File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?,
-    );
+    let mut output =
+        File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+    let scheduled = ScheduledKey::new(key)?;
+    let ivs = IvGen::new(key);
 
-    let mut written = 0u64;
-    let mut page_index = 0u64;
-    let mut page = vec![0u8; PAGE_SIZE];
-    while written < meta.plaintext_size {
-        input.read_exact(&mut page).with_context(|| {
-            format!(
-                "{} ended before plaintext byte {}",
-                src.display(),
-                meta.plaintext_size
-            )
-        })?;
-        let iv = derive_iv(key, page_index);
-        decrypt_page(key, &iv, &mut page)?;
-        let remain = (meta.plaintext_size - written) as usize;
-        let take = remain.min(PAGE_SIZE);
-        if page_index == 0 && (take < 8 || &page[4..8] != b"ftyp") {
-            bail!(
-                "decrypted {} does not start with an MP4 ftyp box; the key does not match this clip",
-                src.display()
-            );
+    let written = CHUNK.with(|slot| -> Result<u64> {
+        let mut buf = slot.borrow_mut();
+        if buf.len() < CHUNK_BYTES {
+            buf.resize(CHUNK_BYTES, 0);
         }
-        output
-            .write_all(&page[..take])
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        written += take as u64;
-        page_index += 1;
-    }
-    output
-        .flush()
-        .with_context(|| format!("cannot flush {}", tmp.display()))?;
-    sync_output(output.get_ref()).with_context(|| format!("cannot sync {}", tmp.display()))?;
+        let chunk = &mut buf[..CHUNK_BYTES];
+        let mut written = 0u64;
+        let mut page_index = 0u64;
+        while written < meta.plaintext_size {
+            let remain = meta.plaintext_size - written;
+            let pages_needed = remain.div_ceil(PAGE_SIZE as u64) as usize;
+            let pages = pages_needed.min(CHUNK_PAGES);
+            let nbytes = pages * PAGE_SIZE;
+            input.read_exact(&mut chunk[..nbytes]).with_context(|| {
+                format!(
+                    "{} ended before plaintext byte {}",
+                    src.display(),
+                    meta.plaintext_size
+                )
+            })?;
+            for page in 0..pages {
+                let start = page * PAGE_SIZE;
+                let block = &mut chunk[start..start + PAGE_SIZE];
+                let iv = ivs.iv(page_index);
+                scheduled.decrypt_page(&iv, block)?;
+                if page_index == 0 {
+                    let take = (remain as usize).min(PAGE_SIZE);
+                    if take < 8 || &block[4..8] != b"ftyp" {
+                        bail!(
+                            "decrypted {} does not start with an MP4 ftyp box; the key does not match this clip",
+                            src.display()
+                        );
+                    }
+                }
+                page_index += 1;
+            }
+            let plain_bytes = (remain as usize).min(nbytes);
+            output
+                .write_all(&chunk[..plain_bytes])
+                .with_context(|| format!("cannot write {}", tmp.display()))?;
+            written += plain_bytes as u64;
+        }
+        Ok(written)
+    })?;
+    sync_output(&output).with_context(|| format!("cannot sync {}", tmp.display()))?;
     drop(output);
 
     #[cfg(unix)]
@@ -287,6 +370,20 @@ pub fn decrypt_file(src: &Path, dest: &Path, key: &[u8]) -> Result<u64> {
         .with_context(|| format!("cannot replace {} with decrypted output", dest.display()))?;
     guard.disarm();
     Ok(written)
+}
+
+fn advise_sequential(file: &File) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 1);
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = file;
+    }
 }
 
 /// `File::sync_all` on macOS is `F_FULLFSYNC`. SMB rejects that with ENOTSUP
@@ -476,6 +573,44 @@ mod tests {
         let err = decrypt_file(&src, &dir.join("bad.mp4"), &[0x22u8; 16]).unwrap_err();
         assert!(err.to_string().contains("ftyp"), "{err}");
         assert!(!dir.join("bad.mp4").exists());
+
+        let key256 = [0x44u8; 32];
+        let sealed256 = seal(&plain, &key256, "5YJ3E1EA7KF000001", 7, 1_700_000_123);
+        fs::write(&src, &sealed256).unwrap();
+        let dest256 = dir.join("out256.mp4");
+        assert_eq!(
+            decrypt_file(&src, &dest256, &key256).unwrap(),
+            plain.len() as u64
+        );
+        assert_eq!(fs::read(&dest256).unwrap(), plain);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trip_crosses_a_one_mebibyte_read() {
+        let key = [0x33u8; 16];
+        let mut plain = vec![0u8; CHUNK_BYTES + 64];
+        plain[4..8].copy_from_slice(b"ftyp");
+        plain[8..12].copy_from_slice(b"isom");
+        for (i, byte) in plain.iter_mut().enumerate().skip(12) {
+            *byte = (i % 251) as u8;
+        }
+        let sealed = seal(&plain, &key, "5YJ3E1EA7KF000001", 4, 11);
+        let dir = std::env::temp_dir().join(format!(
+            "tesdec-chunk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mp4");
+        let dest = dir.join("out.mp4");
+        fs::write(&src, &sealed).unwrap();
+        let n = decrypt_file(&src, &dest, &key).unwrap();
+        assert_eq!(n, plain.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), plain);
         let _ = fs::remove_dir_all(&dir);
     }
 

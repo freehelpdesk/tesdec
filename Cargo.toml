@@ -31,3 +31,11 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 tao = { version = "0.37", optional = true }
 wry = { version = "0.57", optional = true }
+
+# `cargo run` is the usual command. Debug builds of the AES loop are many
+# times slower than an optimized one, so keep this profile optimized.
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
